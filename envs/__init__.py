@@ -13,5 +13,3 @@ register(
     kwargs={"mode": -1},  # Set to -1 for multimodal (two goals)
 )
 
-
-gym.make('maze2dtwogoals-v0')
