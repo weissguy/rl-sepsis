@@ -2,6 +2,7 @@ import numpy as np
 import gymnasium as gym
 import pandas as pd
 import torch
+from stable_baselines3.common.env_checker import check_env
 
 import sys
 import os
@@ -12,21 +13,23 @@ from lstm_ae import Encoder
 class Patient:
 
     def __init__(self, df, icustayid):
+
         self.patient_df = df.loc[df['icustayid'] == icustayid]
-        # TODO: decide on in-hosp or 48h mortality
         self.mortality = self.patient_df['died_in_hosp'].values[0]
+
         self.state_cols = ['gender', 'age', 'elixhauser', 're_admission', 'Weight_kg', 'GCS', 'HR', 'SysBP', 
-                    'MeanBP', 'DiaBP', 'RR', 'SpO2', 'Temp_C', 'FiO2_1', 'Potassium', 'Sodium', 
-                    'Chloride', 'Glucose', 'BUN', 'Creatinine', 'Magnesium', 'Calcium', 'Ionised_Ca', 
-                    'CO2_mEqL', 'SGOT', 'SGPT', 'Total_bili', 'Albumin', 'Hb', 'WBC_count', 'Platelets_count',
-                    'PTT', 'PT', 'INR', 'Arterial_pH', 'paO2', 'paCO2', 'Arterial_BE', 'Arterial_lactate', 
-                    'HCO3', 'mechvent', 'Shock_Index', 'PaO2_FiO2', 'cumulated_balance']
+            'MeanBP', 'DiaBP', 'RR', 'SpO2', 'Temp_C', 'FiO2_1', 'Potassium', 'Sodium', 
+            'Chloride', 'Glucose', 'BUN', 'Creatinine', 'Magnesium', 'Calcium', 'Ionised_Ca', 
+            'CO2_mEqL', 'SGOT', 'SGPT', 'Total_bili', 'Albumin', 'Hb', 'WBC_count', 'Platelets_count',
+            'PTT', 'PT', 'INR', 'Arterial_pH', 'paO2', 'paCO2', 'Arterial_BE', 'Arterial_lactate', 
+            'HCO3', 'mechvent', 'Shock_Index', 'PaO2_FiO2', 'cumulated_balance']
 
     def get_patient_data(self, index):
         if self.is_stay_over(index):
             raise ValueError('Patient ICU stay is over. No next state available.')
         
-        return self.patient_df[self.state_cols].iloc[index]
+        patient_state_df = self.patient_df[self.state_cols]
+        return patient_state_df.iloc[index].to_numpy(dtype=np.float32)
 
     def is_stay_over(self, index):
         return index >= len(self.patient_df)
@@ -41,11 +44,11 @@ class MIMICEnv(gym.Env):
     def __init__(self):
 
         # continuous, 20-dimensional vector (for now)
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32)
-        self.obs_dim = (20,)
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(44,), dtype=np.float32)
+        self.obs_dim = (44,)
 
         # discrete, (5,5) actions
-        self.action_space = gym.spaces.MultiDiscrete([5, 5])
+        self.action_space = gym.spaces.Discrete(5)
         self.action_dim = (5, 5)
 
         # load sepsis_df
@@ -89,6 +92,7 @@ class MIMICEnv(gym.Env):
         else:
             state_data = self.patient.get_patient_data(self.current_index)
             # get the vector from the pre-saved csv
+            return state_data
     
     def _get_reward(self, done):
         """
@@ -119,3 +123,4 @@ class MIMICEnv(gym.Env):
 
 if __name__ == '__main__':
     env = MIMICEnv()
+    check_env(env)
