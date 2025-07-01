@@ -13,18 +13,20 @@ class Patient:
 
     def __init__(self, df, icustayid):
         self.patient_df = df.loc[df['icustayid'] == icustayid]
-        self.mortality = self.patient_df['died_in_hosp_or_within_48h'].values[0]
+        # TODO: decide on in-hosp or 48h mortality
+        self.mortality = self.patient_df['died_in_hosp'].values[0]
+        self.state_cols = ['gender', 'age', 'elixhauser', 're_admission', 'Weight_kg', 'GCS', 'HR', 'SysBP', 
+                    'MeanBP', 'DiaBP', 'RR', 'SpO2', 'Temp_C', 'FiO2_1', 'Potassium', 'Sodium', 
+                    'Chloride', 'Glucose', 'BUN', 'Creatinine', 'Magnesium', 'Calcium', 'Ionised_Ca', 
+                    'CO2_mEqL', 'SGOT', 'SGPT', 'Total_bili', 'Albumin', 'Hb', 'WBC_count', 'Platelets_count',
+                    'PTT', 'PT', 'INR', 'Arterial_pH', 'paO2', 'paCO2', 'Arterial_BE', 'Arterial_lactate', 
+                    'HCO3', 'mechvent', 'Shock_Index', 'PaO2_FiO2', 'cumulated_balance']
 
-    def get_state(self, index):
+    def get_patient_data(self, index):
         if self.is_stay_over(index):
             raise ValueError('Patient ICU stay is over. No next state available.')
         
-        state_data = self.patient_df.iloc[index]
-        state_tensor = torch.tensor(state_data.values, dtype=torch.float32).unsqueeze(0) # TODO unsqueeze?
-        with torch.no_grad():
-            latent = self.state_encoder(state_tensor)
-
-        return latent
+        return self.patient_df[self.state_cols].iloc[index]
 
     def is_stay_over(self, index):
         return index >= len(self.patient_df)
@@ -38,17 +40,16 @@ class MIMICEnv(gym.Env):
 
     def __init__(self):
 
-        # continuous, 44-dimensional vector (for now)
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(44,), dtype=np.float32)
-        self.obs_dim = (44,)
+        # continuous, 20-dimensional vector (for now)
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32)
+        self.obs_dim = (20,)
 
         # discrete, (5,5) actions
         self.action_space = gym.spaces.MultiDiscrete([5, 5])
         self.action_dim = (5, 5)
-        self.action_log = {}
 
         # load sepsis_df
-        self.sepsis_df = pd.read_csv('data/MIMICtable.csv') # TODO: change to sepsis_df
+        self.sepsis_df = pd.read_csv('data/sepsis_df.csv')
         self.icustayids = self.sepsis_df['icustayid'].unique()
 
         # load patient data
@@ -61,53 +62,50 @@ class MIMICEnv(gym.Env):
         self.state_encoder.load_state_dict(torch.load('models/lstm_encoder.pth'))
         self.state_encoder.eval()
 
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.state_encoder.to(self.device)
+
     
     def reset(self, seed=None, options=None):
-        super().reset(seed, options)
+        super().reset()
 
         # some logic for (randomly?) choosing a new state
         self.patient_id = np.random.choice(self.icustayids)
         self.patient = Patient(self.sepsis_df, self.patient_id)
         self.current_index = 0
 
-        self.action_log[self.patient_id] = []
-
-        observation = self.patient.get_next_state()
+        observation = self._get_obs(done=False)
         info = {}
 
         return observation, info
     
     def _get_obs(self, done):
         """
-        Returns the current state of the patient.
+        Returns the current state of the patient (as a latent vector).
         If the patient is in a terminal state, returns an array of zeros.
         """
         if done:
-            return np.zeros(self.state_encoder.latent_dim) # dummy state
+            return np.zeros(self.obs_dim) # dummy state
         else:
-            return self.patient.get_state(self.current_index)
+            state_data = self.patient.get_patient_data(self.current_index)
+            # get the vector from the pre-saved csv
     
     def _get_reward(self, done):
         """
         Assumes that the current state is a terminal state. 
         +1 if patient survives, -1 if they die.
         """
-        if done:
-            if self.patient.survives():
-                return 15
-            else:
-                return -15
+        if done and self.patient.survives():
+            return 15
+        elif done and not self.patient.survives():
+            return -15
         else:
             return 0
+        
     
-
     def step(self, action):
 
         self.current_index += 1
-
-        # log the action
-        # TODO: action is a np array
-        self.action_log[self.patient_id].append(action)
 
         # check if the episode is done
         done = self.patient.is_stay_over(self.current_index)
@@ -119,4 +117,5 @@ class MIMICEnv(gym.Env):
 
 
 
-env = MIMICEnv()
+if __name__ == '__main__':
+    env = MIMICEnv()

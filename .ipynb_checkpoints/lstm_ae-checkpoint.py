@@ -6,7 +6,7 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 class Encoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, latent_dim, dropout, seq_len):
+    def __init__(self, input_dim, hidden_dim, latent_dim, seq_len, dropout=0.0):
         super().__init__()
         self.input_size = input_dim
         self.hidden_size = hidden_dim
@@ -16,18 +16,27 @@ class Encoder(nn.Module):
         self.lstm_enc = nn.LSTM(input_dim, hidden_dim, dropout=dropout, batch_first=True)
         self.fc_enc = nn.Linear(hidden_dim, latent_dim)
 
-    def forward(self, x, lengths):
+    def forward(self, x, lengths, return_all_latents=False):
         x_packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
         out_packed, (last_h_state, last_c_state) = self.lstm_enc(x_packed)
-        out = pad_packed_sequence(out_packed, batch_first=True, total_length=x.size(1))
+        out, _ = pad_packed_sequence(out_packed, batch_first=True, total_length=x.size(1))
         
-        x_enc = self.fc_enc(last_h_state.squeeze(dim=0))
-        
-        return x_enc, out
+        if return_all_latents:
+            latents = self.fc_enc(out)  # (batch_size, seq_len, latent_dim)
+            # Collect only valid (unpadded) latents using lengths
+            valid_latents = []
+            for i, seq_len in enumerate(lengths):
+                valid_latents.append(latents[i, :seq_len])
+            valid_latents = torch.cat(valid_latents, dim=0)  # (total_valid_timesteps, latent_dim)
+            return valid_latents, out  # all latents, and output of lstm
+            
+        else:
+            x_enc = self.fc_enc(last_h_state.squeeze(dim=0))
+            return x_enc, out # last latent, and output of lstm (TODO: what if the last latent corresponds to a padded input?)
 
 
 class Decoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, latent_dim, dropout, seq_len):
+    def __init__(self, input_dim, hidden_dim, latent_dim, seq_len, dropout):
         super().__init__()
         self.input_size = input_dim
         self.hidden_size = hidden_dim
@@ -51,8 +60,8 @@ class LSTMAE(nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim, seq_len, dropout_ratio=0.0):
         super(LSTMAE, self).__init__()
 
-        self.encoder = Encoder(input_dim, hidden_dim, latent_dim, dropout_ratio, seq_len)
-        self.decoder = Decoder(input_dim, hidden_dim, latent_dim, dropout_ratio, seq_len)
+        self.encoder = Encoder(input_dim, hidden_dim, latent_dim, seq_len, dropout_ratio)
+        self.decoder = Decoder(input_dim, hidden_dim, latent_dim, seq_len, dropout_ratio)
 
     def forward(self, x, lengths, return_last_h=False, return_enc_out=False):
         x_enc, enc_out = self.encoder(x, lengths)

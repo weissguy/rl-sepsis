@@ -15,5 +15,6 @@ setup(
         'matplotlib',
         'jax',
         'flax',
+        'stable-baselines3',
     ]
 )
