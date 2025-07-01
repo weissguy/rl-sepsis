@@ -12,27 +12,19 @@ from lstm_ae import Encoder
 
 class Patient:
 
-    def __init__(self, df, icustayid):
-
-        self.patient_df = df.loc[df['icustayid'] == icustayid]
+    def __init__(self, patient_df, latent_df, icustayid):
+        self.patient_df = patient_df.loc[patient_df['icustayid'] == icustayid]
+        self.latent_df = latent_df.loc[latent_df['icustayid'] == icustayid]
         self.mortality = self.patient_df['died_in_hosp'].values[0]
-
-        self.state_cols = ['gender', 'age', 'elixhauser', 're_admission', 'Weight_kg', 'GCS', 'HR', 'SysBP', 
-            'MeanBP', 'DiaBP', 'RR', 'SpO2', 'Temp_C', 'FiO2_1', 'Potassium', 'Sodium', 
-            'Chloride', 'Glucose', 'BUN', 'Creatinine', 'Magnesium', 'Calcium', 'Ionised_Ca', 
-            'CO2_mEqL', 'SGOT', 'SGPT', 'Total_bili', 'Albumin', 'Hb', 'WBC_count', 'Platelets_count',
-            'PTT', 'PT', 'INR', 'Arterial_pH', 'paO2', 'paCO2', 'Arterial_BE', 'Arterial_lactate', 
-            'HCO3', 'mechvent', 'Shock_Index', 'PaO2_FiO2', 'cumulated_balance']
 
     def get_patient_data(self, index):
         if self.is_stay_over(index):
             raise ValueError('Patient ICU stay is over. No next state available.')
-        
-        patient_state_df = self.patient_df[self.state_cols]
-        return patient_state_df.iloc[index].to_numpy(dtype=np.float32)
+    
+        return self.latent_df.iloc[index].to_numpy(dtype=np.float32)
 
     def is_stay_over(self, index):
-        return index >= len(self.patient_df)
+        return index >= len(self.latent_df)
     
     def survives(self):
         return self.mortality == 0
@@ -44,16 +36,17 @@ class MIMICEnv(gym.Env):
     def __init__(self):
 
         # continuous, 20-dimensional vector (for now)
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(44,), dtype=np.float32)
-        self.obs_dim = (44,)
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32)
+        self.obs_dim = (20,)
 
         # discrete, (5,5) actions
-        self.action_space = gym.spaces.Discrete(5)
+        self.action_space = gym.spaces.MultiDiscrete([5, 5])
         self.action_dim = (5, 5)
 
         # load sepsis_df
         self.sepsis_df = pd.read_csv('data/sepsis_df.csv')
         self.icustayids = self.sepsis_df['icustayid'].unique()
+        self.latent_df = pd.read_csv('data/latent_states.csv')
 
         # load patient data
         self.patient_id = None
@@ -74,7 +67,7 @@ class MIMICEnv(gym.Env):
 
         # some logic for (randomly?) choosing a new state
         self.patient_id = np.random.choice(self.icustayids)
-        self.patient = Patient(self.sepsis_df, self.patient_id)
+        self.patient = Patient(self.sepsis_df, self.latent_df, self.patient_id)
         self.current_index = 0
 
         observation = self._get_obs(done=False)
