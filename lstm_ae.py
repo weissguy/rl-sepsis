@@ -23,7 +23,7 @@ class Encoder(nn.Module):
         
         if return_all_latents:
             latents = self.fc_enc(out)  # (batch_size, seq_len, latent_dim)
-            # Collect only valid (unpadded) latents using lengths
+            # collect only valid (unpadded) latents using lengths
             valid_latents = []
             for i, seq_len in enumerate(lengths):
                 valid_latents.append(latents[i, :seq_len])
@@ -31,12 +31,12 @@ class Encoder(nn.Module):
             return valid_latents, out  # all latents, and output of lstm
             
         else:
-            x_enc = self.fc_enc(last_h_state.squeeze(dim=0))
+            x_enc = self.fc_enc(last_h_state.squeeze(0))
             return x_enc, out # last latent, and output of lstm (TODO: what if the last latent corresponds to a padded input?)
 
 
 class Decoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, latent_dim, seq_len, dropout):
+    def __init__(self, input_dim, hidden_dim, latent_dim, seq_len, dropout=0.0):
         super().__init__()
         self.input_size = input_dim
         self.hidden_size = hidden_dim
@@ -47,11 +47,16 @@ class Decoder(nn.Module):
         self.lstm_dec = nn.LSTM(hidden_dim, hidden_dim, dropout=dropout, batch_first=True)
         self.out = nn.Linear(hidden_dim, input_dim)
 
-    def forward(self, z):
-        # we don't need to worry about padding here b/c it's excluded from the encoder output
+    def forward(self, z, lengths):
         decoder_input = self.fc_dec(z).unsqueeze(1).repeat(1, self.seq_len, 1)
         dec_out, (hidden_state, cell_state) = self.lstm_dec(decoder_input)
         dec_out = self.out(dec_out)
+
+        # collect only valid (unpadded) outputs using lengths
+        valid_outputs = []
+        for i, seq_len in enumerate(lengths):
+            valid_outputs.append(dec_out[i, :seq_len])
+        dec_out = torch.cat(valid_outputs, dim=0)
 
         return dec_out, hidden_state
 
@@ -65,7 +70,7 @@ class LSTMAE(nn.Module):
 
     def forward(self, x, lengths, return_last_h=False, return_enc_out=False):
         x_enc, enc_out = self.encoder(x, lengths)
-        x_dec, last_h = self.decoder(x_enc)
+        x_dec, last_h = self.decoder(x_enc, lengths)
 
         if return_last_h:
             return x_dec, last_h

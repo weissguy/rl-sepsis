@@ -12,19 +12,22 @@ from lstm_ae import Encoder
 
 class Patient:
 
-    def __init__(self, patient_df, latent_df, icustayid):
-        self.patient_df = patient_df.loc[patient_df['icustayid'] == icustayid]
-        self.latent_df = latent_df.loc[latent_df['icustayid'] == icustayid]
-        self.mortality = self.patient_df['died_in_hosp'].values[0]
+    def __init__(self, latent_df, icustayid):
+        self.icustayid = icustayid
+        self.latent_df = latent_df[latent_df['icustayid'] == icustayid]
+        self.latent_cols = [f'latent_{num}' for num in range(1, 21)]
+        self.mortality = self.latent_df['died_in_hosp'].iloc[0]
 
     def get_patient_data(self, index):
         if self.is_stay_over(index):
+            print(f'{self.icustayid=}, {index=}')
             raise ValueError('Patient ICU stay is over. No next state available.')
     
-        return self.latent_df.iloc[index].to_numpy(dtype=np.float32)
+        return self.latent_df[self.latent_cols].iloc[index].to_numpy(dtype=np.float32)
 
     def is_stay_over(self, index):
-        return index >= len(self.latent_df)
+        terminal_state = self.latent_df['terminal_state'].iloc[index]
+        return terminal_state == 1
     
     def survives(self):
         return self.mortality == 0
@@ -39,21 +42,22 @@ class MIMICEnv(gym.Env):
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32)
         self.obs_dim = (20,)
 
-        # discrete, (5,5) actions
-        self.action_space = gym.spaces.MultiDiscrete([5, 5])
-        self.action_dim = (5, 5)
+        # discrete, (5,5) actions --> maps to 25 discrete 1D actions
+        self.action_space = gym.spaces.Discrete(25)
+        self.action_dim = 25 # technically (5,5)
+        self.actions_to_ids = {(iv, vaso): (5*iv + vaso) for iv in range(5) for vaso in range(5)}
+        self.ids_to_actions = {v: k for k, v in self.actions_to_ids.items()}
 
         # load sepsis_df
-        self.sepsis_df = pd.read_csv('data/sepsis_df.csv')
-        self.icustayids = self.sepsis_df['icustayid'].unique()
         self.latent_df = pd.read_csv('data/latent_states.csv')
+        self.icustayids = self.latent_df['icustayid'].unique()
 
         # load patient data
         self.patient_id = None
         self.patient = None
         self.current_index = None
 
-        # load lstm encoder model
+        # load lstm encoder model -- not using here rn bc presaved latent states
         self.state_encoder = Encoder(input_dim=44, hidden_dim=256, latent_dim=20, dropout=0.0, seq_len=50)
         self.state_encoder.load_state_dict(torch.load('models/lstm_encoder.pth'))
         self.state_encoder.eval()
@@ -65,9 +69,9 @@ class MIMICEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset()
 
-        # some logic for (randomly?) choosing a new state
+        # some logic for (randomly) choosing a new state
         self.patient_id = np.random.choice(self.icustayids)
-        self.patient = Patient(self.sepsis_df, self.latent_df, self.patient_id)
+        self.patient = Patient(self.latent_df, self.patient_id)
         self.current_index = 0
 
         observation = self._get_obs(done=False)
@@ -84,7 +88,7 @@ class MIMICEnv(gym.Env):
             return np.zeros(self.obs_dim) # dummy state
         else:
             state_data = self.patient.get_patient_data(self.current_index)
-            # get the vector from the pre-saved csv
+            # returns the vector from the pre-saved latent df
             return state_data
     
     def _get_reward(self, done):
@@ -107,10 +111,10 @@ class MIMICEnv(gym.Env):
         # check if the episode is done
         done = self.patient.is_stay_over(self.current_index)
 
-        updated_state = self._get_obs(done)
+        new_state = self._get_obs(done)
         reward = self._get_reward(done)
 
-        return updated_state, reward, done, False, {}
+        return new_state, reward, done, False, {}
 
 
 
