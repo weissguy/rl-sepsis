@@ -47,16 +47,17 @@ class Decoder(nn.Module):
         self.lstm_dec = nn.LSTM(hidden_dim, hidden_dim, dropout=dropout, batch_first=True)
         self.out = nn.Linear(hidden_dim, input_dim)
 
-    def forward(self, z, lengths):
+    def forward(self, z, lengths, return_all_reconstructions=False):
         decoder_input = self.fc_dec(z).unsqueeze(1).repeat(1, self.seq_len, 1)
         dec_out, (hidden_state, cell_state) = self.lstm_dec(decoder_input)
         dec_out = self.out(dec_out)
 
-        # collect only valid (unpadded) outputs using lengths
-        valid_outputs = []
-        for i, seq_len in enumerate(lengths):
-            valid_outputs.append(dec_out[i, :seq_len])
-        dec_out = torch.cat(valid_outputs, dim=0)
+        if return_all_reconstructions:
+            # collect only valid (unpadded) outputs using lengths
+            valid_outputs = []
+            for i, seq_len in enumerate(lengths):
+                valid_outputs.append(dec_out[i, :seq_len])
+            dec_out = torch.cat(valid_outputs, dim=0)
 
         return dec_out, hidden_state
 
