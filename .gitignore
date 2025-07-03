@@ -1,6 +1,0 @@
-data/*.csv
-misc
-__pycache__
-.ipynb_checkpoints
-.DS_Store
-.gitignore
