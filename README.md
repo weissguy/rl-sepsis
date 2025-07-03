@@ -1,6 +1,4 @@
 ## Overview
-integrating clinician feedback into rl algorithms to try to improve icu treatment outcomes. or something like that. @polimi deib
+offline rl methods for designing icu treatment plans. playing around with personalized/dynamic/behavior-aligned reward functions, as well as continuous state space representations and state transition models. or something like that.
 
-## Acknowledgement
-variational preference learning (vpl) implementation is courtesy of [https://github.com/WEIRDLabUW/vpl.git](url)
-implicit q-learning (iql) implementation is courtesy of [https://github.com/ikostrikov/implicit_q_learning.git](url)
+@politecnico di milano, deib
