@@ -10,7 +10,7 @@ import random
 class ReplayMemory():
 
     def __init__(self, memory_capacity=10000):
-        self.buffer = deque(memory_capacity)
+        self.buffer = deque(maxlen=memory_capacity)
 
     def store(self, state, action, reward, next_state, done):
         self.buffer.append((state, action, reward, next_state, done))
@@ -46,16 +46,14 @@ class DDDQN(nn.Module):
         value = self.value(x)
 
         # TODO: wtf is the shape of this
-        return value + (advantage - advantage.mean(dim=1, keepdim=True)[0])
+        return value + (advantage - advantage.mean(dim=1, keepdim=True))
     
-    # TODO: will we ever want to just return the advantage?
     
 
 
-# TODO: ensure this interfaces well with OpenAI gym. I think it should.
 class DDDQN_Agent():
 
-    def __init__(self, state_dim, action_dim, hidden_dim=64, gamma=0.99, replace=100, lr=0.001, 
+    def __init__(self, state_dim, action_dim, hidden_dim=64, gamma=0.99, lr=0.001, 
                  memory_capacity=10000, batch_size=64):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.state_dim = state_dim # 20, i.e., (20,) latent vector
@@ -77,7 +75,7 @@ class DDDQN_Agent():
         """ Store tuple in memory. """
         self.memory.store(state, action, reward, next_state, done)
         if len(self.memory) > self.batch_size:
-            self.update_model()
+            self.update_model() # this is the main training loop
 
 
     def select_action(self, state):
@@ -89,7 +87,7 @@ class DDDQN_Agent():
             action_values = self.main_network(state)
 
         self.main_network.train()
-        return np.argmax(action_values.cpu().data.numpy())
+        return np.argmax(action_values.cpu().data.numpy()) # in [0, 24]
         
 
     def update_model(self):
@@ -105,7 +103,7 @@ class DDDQN_Agent():
         q_values = self.main_network(states).gather(1, actions.unsqueeze(-1)).squeeze(-1)
 
         next_action_values = self.main_network(next_states).max(1)[1].unsqueeze(-1)
-        next_q_values = self.target_network(next_states).gather(1, next_action_values).detach().squeeze(-1)
+        next_q_values = self.target_network(next_states).gather(1, next_action_values).detach().squeeze(-1) # NOTE: target network!!
 
         expected_q_values = rewards + self.gamma * next_q_values * (1 - dones)
 

@@ -1,7 +1,7 @@
 import numpy as np
 import gymnasium as gym
 import pandas as pd
-import torch
+#import torch
 from stable_baselines3.common.env_checker import check_env
 
 import sys
@@ -14,19 +14,21 @@ class Patient:
 
     def __init__(self, latent_df, icustayid):
         self.icustayid = icustayid
+        self.index = 0
         self.latent_df = latent_df[latent_df['icustayid'] == icustayid]
         self.latent_cols = [f'latent_{num}' for num in range(1, 21)]
         self.mortality = self.latent_df['died_in_hosp'].iloc[0]
 
-    def get_patient_data(self, index):
-        if self.is_stay_over(index):
-            print(f'{self.icustayid=}, {index=}')
+    def get_next_state(self):
+        if self.is_stay_over():
             raise ValueError('Patient ICU stay is over. No next state available.')
-    
-        return self.latent_df[self.latent_cols].iloc[index].to_numpy(dtype=np.float32)
+        
+        next_state = self.latent_df[self.latent_cols].iloc[self.index].to_numpy(dtype=np.float32)
+        self.index += 1
+        return next_state
 
-    def is_stay_over(self, index):
-        terminal_state = self.latent_df['terminal_state'].iloc[index]
+    def is_stay_over(self):
+        terminal_state = self.latent_df['terminal_state'].iloc[self.index]
         return terminal_state == 1
     
     def survives(self):
@@ -40,7 +42,7 @@ class MIMICEnv(gym.Env):
 
         # continuous, 20-dimensional vector (for now)
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32)
-        self.obs_dim = (20,)
+        self.obs_dim = 20
 
         # discrete, (5,5) actions --> maps to 25 discrete 1D actions
         self.action_space = gym.spaces.Discrete(25)
@@ -53,26 +55,23 @@ class MIMICEnv(gym.Env):
         self.icustayids = self.latent_df['icustayid'].unique()
 
         # load patient data
-        self.patient_id = None
         self.patient = None
-        self.current_index = None
 
         # load lstm encoder model -- not using here rn bc presaved latent states
-        self.state_encoder = Encoder(input_dim=44, hidden_dim=256, latent_dim=20, dropout=0.0, seq_len=50)
-        self.state_encoder.load_state_dict(torch.load('models/lstm_encoder.pth'))
-        self.state_encoder.eval()
+        #self.state_encoder = Encoder(input_dim=46, hidden_dim=64, latent_dim=20, dropout=0.0, seq_len=20)
+        #self.state_encoder.load_state_dict(torch.load('models/lstm_encoder.pth'))
+        #self.state_encoder.eval()
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.state_encoder.to(self.device)
+        #self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        #self.state_encoder.to(self.device)
 
     
     def reset(self, seed=None, options=None):
         super().reset()
 
         # some logic for (randomly) choosing a new state
-        self.patient_id = np.random.choice(self.icustayids)
-        self.patient = Patient(self.latent_df, self.patient_id)
-        self.current_index = 0
+        idx = np.random.choice(self.icustayids)
+        self.patient = Patient(self.latent_df, idx)
 
         observation = self._get_obs(done=False)
         info = {}
@@ -87,9 +86,7 @@ class MIMICEnv(gym.Env):
         if done:
             return np.zeros(self.obs_dim) # dummy state
         else:
-            state_data = self.patient.get_patient_data(self.current_index)
-            # returns the vector from the pre-saved latent df
-            return state_data
+            return self.patient.get_next_state()
     
     def _get_reward(self, done):
         """
@@ -106,10 +103,8 @@ class MIMICEnv(gym.Env):
     
     def step(self, action):
 
-        self.current_index += 1
-
         # check if the episode is done
-        done = self.patient.is_stay_over(self.current_index)
+        done = self.patient.is_stay_over()
 
         new_state = self._get_obs(done)
         reward = self._get_reward(done)
