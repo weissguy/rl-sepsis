@@ -25,7 +25,7 @@ class ReplayMemory():
 
 # low key diners drive ins and dives ah q-network
 
-class DDDQN(nn.Module):
+class DDQN(nn.Module):
 
     # TODO: add batch normalization, leaky relu, 'projection onto the action space' (from raghu, et al.)
     def __init__(self, state_dim, action_dim, hidden_dim):
@@ -45,13 +45,12 @@ class DDDQN(nn.Module):
         advantage = self.advantage(x)
         value = self.value(x)
 
-        # TODO: wtf is the shape of this
-        return value + (advantage - advantage.mean(dim=1, keepdim=True))
+        return value + (advantage - advantage.mean(dim=1, keepdim=True)) # (25,)
     
     
 
 
-class DDDQN_Agent():
+class DDQNAgent():
 
     def __init__(self, state_dim, action_dim, hidden_dim=64, gamma=0.99, lr=0.001, 
                  memory_capacity=10000, batch_size=64):
@@ -61,10 +60,10 @@ class DDDQN_Agent():
         self.gamma = gamma
         self.batch_size = batch_size
 
-        self.main_network = DDDQN(state_dim, action_dim, hidden_dim).to(self.device)
+        self.main_network = DDQN(state_dim, action_dim, hidden_dim).to(self.device)
         self.optimizer = torch.optim.Adam(self.main_network.parameters(), lr=lr) # only for main network!
 
-        self.target_network = DDDQN(state_dim, action_dim, hidden_dim).to(self.device)
+        self.target_network = DDQN(state_dim, action_dim, hidden_dim).to(self.device)
         self.target_network.load_state_dict(self.main_network.state_dict()) # same as main_network @init
         self.target_network.eval()
 
@@ -117,3 +116,39 @@ class DDDQN_Agent():
         """ Periodically update target network parameters to match main network """
         self.target_network.load_state_dict(self.main_network.state_dict())
 
+
+
+class CQLAgent(DDQNAgent):
+    """ Essentially DQN, but performs a Q value update for which the expectation is a lower bound of the actual Q value! """
+
+    def cql_loss(self, q_values, current_action):
+        """ Computes the CQL loss for a batch of Q-values. """
+        logsumexp = torch.logsumexp(q_values, dim=-1)
+        q_a = q_values.gather(-1, current_action)
+        return (logsumexp - q_a).mean()
+    
+
+    def update_model(self):
+        """ Update model based on loss between expected Q values (from DDDQN) and actual Q values """
+        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size) # stochastic
+
+        states = torch.from_numpy(states).float().to(self.device)
+        actions = torch.from_numpy(np.array(actions)).long().to(self.device) # TODO: why not list --> tensor?
+        rewards = torch.from_numpy(np.array(rewards)).float().to(self.device)
+        next_states = torch.from_numpy(next_states).float().to(self.device)
+        dones = torch.from_numpy(np.array(dones).astype(np.uint8)).float().to(self.device)
+
+        q_values = self.main_network(states).gather(1, actions.unsqueeze(-1)).squeeze(-1)
+
+        next_action_values = self.main_network(next_states).max(1)[1].unsqueeze(-1)
+        next_q_values = self.target_network(next_states).gather(1, next_action_values).detach().squeeze(-1) # NOTE: target network!!
+
+        expected_q_values = rewards + self.gamma * next_q_values * (1 - dones)
+
+        cql1_loss = self.cql_loss(q_values, actions)
+        td_loss = torch.nn.MSELoss()(q_values, expected_q_values)
+        q1_loss = cql1_loss + 0.5 * td_loss
+
+        self.optimizer.zero_grad()
+        q1_loss.backward()
+        self.optimizer.step()
