@@ -1,1 +1,0 @@
-# surely there must be an easier way to do this. or a simpler benchmark. surely.

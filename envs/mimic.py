@@ -19,12 +19,14 @@ class Patient:
         self.latent_cols = [f'latent_{num}' for num in range(1, 21)]
         self.mortality = self.latent_df['died_in_hosp'].iloc[0]
 
-    def get_next_state(self):
+    def increment_index(self):
+        self.index += 1
+
+    def get_state(self):
         if self.is_stay_over():
             raise ValueError('Patient ICU stay is over. No next state available.')
         
         next_state = self.latent_df[self.latent_cols].iloc[self.index].to_numpy(dtype=np.float32)
-        self.index += 1
         return next_state
 
     def is_stay_over(self):
@@ -46,9 +48,10 @@ class MIMICEnv(gym.Env):
 
         # discrete, (5,5) actions --> maps to 25 discrete 1D actions
         self.action_space = gym.spaces.Discrete(25)
-        self.action_dim = 25 # technically (5,5)
+        self.action_dim = 25
+        self.action_log = np.zeros((5,5))
         self.actions_to_ids = {(iv, vaso): (5*iv + vaso) for iv in range(5) for vaso in range(5)}
-        self.ids_to_actions = {v: k for k, v in self.actions_to_ids.items()}
+        #self.ids_to_actions = {v: k for k, v in self.actions_to_ids.items()}
 
         # load sepsis_df
         self.latent_df = pd.read_csv('data/latent_states.csv')
@@ -86,7 +89,7 @@ class MIMICEnv(gym.Env):
         if done:
             return np.zeros(self.obs_dim) # dummy state
         else:
-            return self.patient.get_next_state()
+            return self.patient.get_state()
     
     def _get_reward(self, done):
         """
@@ -100,12 +103,24 @@ class MIMICEnv(gym.Env):
         else:
             return 0
         
+
+    def log_action(self, action_id):
+        """
+        Updates the action log (a 2D array with action frequencies).
+        """
+        action_tup = self.ids_to_actions[action_id]
+        self.action_log[action_tup] += 1
+        
     
     def step(self, action):
 
-        # check if the episode is done
-        done = self.patient.is_stay_over()
+        self.log_action(action)
 
+        # step forward one timestep
+        self.patient.increment_index()
+
+        # check if this is the last timestep
+        done = self.patient.is_stay_over()
         new_state = self._get_obs(done)
         reward = self._get_reward(done)
 
