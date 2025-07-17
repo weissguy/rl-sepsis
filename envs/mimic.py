@@ -1,37 +1,47 @@
 import numpy as np
 import gymnasium as gym
-import pandas as pd
-#import torch
 from stable_baselines3.common.env_checker import check_env
 
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from lstm_ae import Encoder
 
 
-class Patient:
+class ICUStay:
+    """
+    Stores the information for a single trajectory, corresponding to one ICU stay ID.
+    """
 
-    def __init__(self, latent_df, icustayid):
-        self.icustayid = icustayid
+    def __init__(self, sepsis_df, icustayid):
         self.index = 0
-        self.latent_df = latent_df[latent_df['icustayid'] == icustayid]
-        self.latent_cols = [f'latent_{num}' for num in range(1, 21)]
-        self.mortality = self.latent_df['died_in_hosp'].iloc[0]
+
+        df = sepsis_df[sepsis_df['icustayid'] == icustayid]
+        self.mortality = df['died_in_hosp'].iloc[0]
+
+        # each state is a string rep of a np array --> convert to np array
+        self.states = df['latent_state']
+        self.states = np.stack([np.fromstring(state.strip('[]'), sep=' ', dtype=np.float32) for state in self.states])
+
+        # convert each (iv, vaso) action into a 1D action id
+        self.actions = df.apply(lambda row: (5 * row['iv_bin']) + row['vaso_bin'], axis=1)
 
     def increment_index(self):
         self.index += 1
 
     def get_state(self):
         if self.is_stay_over():
-            raise ValueError('Patient ICU stay is over. No next state available.')
+            raise ValueError('Patient ICU stay is over. No state available.')
         
-        next_state = self.latent_df[self.latent_cols].iloc[self.index].to_numpy(dtype=np.float32)
-        return next_state
+        return self.states[self.index]
+    
+    def get_action(self):
+        if self.is_stay_over():
+            raise ValueError('Patient ICU stay is over. No logged action available.')
+        
+        return self.actions[self.index]
 
     def is_stay_over(self):
-        terminal_state = self.latent_df['terminal_state'].iloc[self.index]
-        return terminal_state == 1
+        return self.index >= len(self.states)
     
     def survives(self):
         return self.mortality == 0
@@ -40,7 +50,7 @@ class Patient:
 
 class MIMICEnv(gym.Env):
 
-    def __init__(self):
+    def __init__(self, df):
 
         # continuous, 20-dimensional vector (for now)
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32)
@@ -49,32 +59,21 @@ class MIMICEnv(gym.Env):
         # discrete, (5,5) actions --> maps to 25 discrete 1D actions
         self.action_space = gym.spaces.Discrete(25)
         self.action_dim = 25
-        self.action_log = np.zeros((5,5))
-        self.actions_to_ids = {(iv, vaso): (5*iv + vaso) for iv in range(5) for vaso in range(5)}
-        #self.ids_to_actions = {v: k for k, v in self.actions_to_ids.items()}
 
         # load sepsis_df
-        self.latent_df = pd.read_csv('data/latent_states.csv')
-        self.icustayids = self.latent_df['icustayid'].unique()
+        self.sepsis_df = df
+        self.icustayids = self.sepsis_df['icustayid'].unique()
 
-        # load patient data
-        self.patient = None
-
-        # load lstm encoder model -- not using here rn bc presaved latent states
-        #self.state_encoder = Encoder(input_dim=46, hidden_dim=64, latent_dim=20, dropout=0.0, seq_len=20)
-        #self.state_encoder.load_state_dict(torch.load('models/lstm_encoder.pth'))
-        #self.state_encoder.eval()
-
-        #self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        #self.state_encoder.to(self.device)
+        # initialize data for one stay
+        self.icustay = None
 
     
     def reset(self, seed=None, options=None):
         super().reset()
 
-        # some logic for (randomly) choosing a new state
+        # randomly choose a new trajectory
         idx = np.random.choice(self.icustayids)
-        self.patient = Patient(self.latent_df, idx)
+        self.icustay = ICUStay(self.sepsis_df, idx)
 
         observation = self._get_obs(done=False)
         info = {}
@@ -83,44 +82,42 @@ class MIMICEnv(gym.Env):
     
     def _get_obs(self, done):
         """
-        Returns the current state of the patient (as a latent vector).
-        If the patient is in a terminal state, returns an array of zeros.
+        Returns the current state of the icu stay (as a latent vector).
+        If the icu stay is in a terminal state, returns an array of zeros.
         """
         if done:
-            return np.zeros(self.obs_dim) # dummy state
+            return np.zeros(self.obs_dim, dtype=np.float32) # dummy state
         else:
-            return self.patient.get_state()
+            return self.icustay.get_state()
     
     def _get_reward(self, done):
         """
         Assumes that the current state is a terminal state. 
         +1 if patient survives, -1 if they die.
         """
-        if done and self.patient.survives():
+        if done and self.icustay.survives():
             return 15
-        elif done and not self.patient.survives():
+        elif done and not self.icustay.survives():
             return -15
         else:
             return 0
         
-
-    def log_action(self, action_id):
+    
+    def get_logged_action(self):
         """
-        Updates the action log (a 2D array with action frequencies).
+        Returns the 1D id for the action logged by the physician at the
+        current timestep.
         """
-        action_tup = self.ids_to_actions[action_id]
-        self.action_log[action_tup] += 1
+        return self.icustay.get_action()
         
     
     def step(self, action):
 
-        self.log_action(action)
-
         # step forward one timestep
-        self.patient.increment_index()
+        self.icustay.increment_index()
 
         # check if this is the last timestep
-        done = self.patient.is_stay_over()
+        done = self.icustay.is_stay_over()
         new_state = self._get_obs(done)
         reward = self._get_reward(done)
 

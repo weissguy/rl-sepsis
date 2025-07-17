@@ -6,32 +6,88 @@ import torch.nn.functional as F
 from collections import deque
 import numpy as np
 import random
+from tqdm import tqdm
+
+
+
+def train_network(self, env, n_episodes=50_000, target_network=False, update_freq=1000):
+    """
+    Training loop to learn a Q-function.
+    """
+    rewards, lengths = [], []
+
+    for i in tqdm(range(n_episodes)):
+        state, _ = env.reset()
+        done = False
+        total_reward, episode_length = 0, 0
+
+        while not done:
+            action = self.select_action(torch.from_numpy(state))
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            # store tuple in memory and do one training step
+            self.learn(state, action, reward, next_state, done)
+            # update for next timestep
+            state = next_state
+            total_reward += reward
+            episode_length += 1
+
+        rewards.append(total_reward)
+        lengths.append(episode_length)
+
+        # update the target network weights to match main network
+        if target_network and i % update_freq == 0:
+            self.hard_update()
+
+    return rewards, lengths
+
+
+
+class PPO():
+    """
+    Proximal Policy Optimization. A policy gradient method.
+    """
+    pass
 
 
 
 class ReplayMemory():
 
-    def __init__(self, memory_capacity=10000):
+    def __init__(self, memory_capacity=100_000):
         self.buffer = deque(maxlen=memory_capacity)
 
     def store(self, state, action, reward, next_state, done):
+        """
+        Stores a (s_t, a, r, s_t+1, d) tuple in memory.
+        """
+        state = torch.from_numpy(state) # np array --> tensor
+        next_state = torch.from_numpy(next_state) # np array --> tensor
         self.buffer.append((state, action, reward, next_state, done))
 
-    def sample(self, batch_size):
+    def sample(self, batch_size, device):
+        """
+        Samples a batch of (s_t, a, r, s_t+1, d) tuples from memory.
+        Returns values as tensors.
+        """
         states, actions, rewards, next_states, dones = zip(*random.sample(self.buffer, batch_size))
-        return np.stack(states), actions, rewards, np.stack(next_states), dones
+
+        states = torch.stack(list(states), dim=0).float().to(device)
+        actions = torch.tensor(actions, dtype=torch.long).to(device)
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
+        next_states = torch.stack(list(next_states), dim=0).float().to(device)
+        dones = torch.tensor(dones, dtype=torch.uint8).to(device)
+
+        return states, actions, rewards, next_states, dones
 
     def __len__(self):
         return len(self.buffer)
     
 
-# low key diners drive ins and dives ah q-network
-
 class DDQN(nn.Module):
     """ Dueling Deep Q-Network! """
 
     # TODO: add batch normalization, leaky relu (from raghu, et al.)
-    def __init__(self, state_dim, action_dim, hidden_dim, dueling=True):
+    def __init__(self, state_dim, action_dim, hidden_dim):
         super().__init__()
         self.fc1 = torch.nn.Linear(state_dim, hidden_dim)
         self.fc2 = torch.nn.Linear(hidden_dim, hidden_dim)
@@ -48,7 +104,7 @@ class DDQN(nn.Module):
         advantage = self.advantage(x)
         value = self.value(x)
 
-        return value + (advantage - advantage.mean(dim=1, keepdim=True)) # (25,)
+        return value + (advantage - advantage.mean()) # (25,)
 
 
 
@@ -61,13 +117,17 @@ class DDQNAgent():
     implement D3QN and CQL (with just a few modifications to the Q-function update).
     """
 
-    def __init__(self, state_dim, action_dim, hidden_dim=64, gamma=0.99, lr=0.001, 
-                 memory_capacity=10000, batch_size=64):
+    def __init__(self, state_dim, action_dim, hidden_dim=128, gamma=0.99, lr=0.001, 
+                 memory_capacity=100_000, batch_size=128, eps_start=0.1, eps_decay=0.9999, eps_final=0.05):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.state_dim = state_dim # 20, i.e., (20,) latent vector
         self.action_dim = action_dim # 25, i.e., 1 q-value per discrete action tuple
         self.gamma = gamma
         self.batch_size = batch_size
+
+        self.eps = eps_start
+        self.eps_decay = eps_decay
+        self.eps_final = eps_final
 
         self.main_network = DDQN(state_dim, action_dim, hidden_dim).to(self.device)
         self.optimizer = torch.optim.Adam(self.main_network.parameters(), lr=lr)
@@ -76,59 +136,71 @@ class DDQNAgent():
 
 
     def learn(self, state, action, reward, next_state, done):
-        """ Store tuple in memory. """
+        """ Store tuple in memory and do one round of model updates. """
         self.memory.store(state, action, reward, next_state, done)
         if len(self.memory) > self.batch_size:
             self.main_network.train()
-            self.update_model() # this is the main training loop
+            self.update_model()
 
 
     def get_action_values(self, state):
-        """ Returns the learned Q-value associated with each action. """
-        state = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+        """ Returns a Tensor, with the learned Q-value associated with each action. """
         self.main_network.eval()
         with torch.no_grad():
-            # Q-values corresponding to each action
-            action_values = self.main_network(state)
-
-        return action_values.cpu().data.numpy() # np array (25,)
-    
+            return self.main_network(state)
+            
 
     def get_action_probs(self, state):
         """ Returns a probability distribution over the action space. """
         action_values = self.get_action_values(state)
-        return F.softmax(action_values)
+        distribution = F.softmax(action_values, dim=-1)
+        return distribution.detach().numpy()
 
 
-    def select_action(self, state):
-        """ Greedily selects action with the highest corr. Q value from the network. """
+    def select_action(self, state, eps=None):
+        """ 
+        With probability 1-eps, selects action with the highest corr. Q value from the network. 
+        With probability eps, selects an action at random.
+        """
+        # choose a random action, with probability eps
+        if eps is None:
+            eps = self.anneal_epsilon()
+        if np.random.rand() < eps:
+            return np.random.randint(self.action_dim)
+        
+        # choose the action that maximizes our q-function, with probability (1-eps)
         action_values = self.get_action_values(state)
-        return np.argmax(action_values) # in [0, 24]
+        return torch.argmax(action_values).item() # in [0, 24]
+    
+
+    def anneal_epsilon(self):
+        """
+        Exponentially decays epsilon until it reaches a min. value.
+        """
+        self.eps = max(self.eps * self.eps_decay, self.eps_final)
+        return self.eps
         
 
     def update_model(self):
-        """ Update model based on loss between expected Q values (from DDDQN) and actual Q values """
-        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size) # stochastic
-
-        states = torch.from_numpy(states).float().to(self.device)
-        actions = torch.from_numpy(np.array(actions)).long().to(self.device) # TODO: why not list --> tensor?
-        rewards = torch.from_numpy(np.array(rewards)).float().to(self.device)
-        next_states = torch.from_numpy(next_states).float().to(self.device)
-        dones = torch.from_numpy(np.array(dones).astype(np.uint8)).float().to(self.device)
+        """
+        Update model based on loss between expected Q values (from DDDQN) and actual Q values.
+        """
+        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size, self.device) # stochastic
 
         q_values = self.main_network(states).gather(1, actions.unsqueeze(-1)).squeeze(-1)
-
         next_action_values = self.main_network(next_states).max(1)[1].unsqueeze(-1)
         next_q_values = self.main_network(next_states).gather(1, next_action_values).detach().squeeze(-1)
 
         expected_q_values = rewards + self.gamma * next_q_values * (1 - dones)
 
-        loss = torch.nn.MSELoss()(q_values, expected_q_values)
+        loss = torch.nn.MSELoss()(q_values, expected_q_values) # TODO: try Huber loss?
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
 
+
+# low key diners drive ins and dives ah q-network
 
 class D3QNAgent(DDQNAgent):
     """ Dueling Double Deep Q-Network Agent. adds in target network """
@@ -144,19 +216,13 @@ class D3QNAgent(DDQNAgent):
 
     def update_model(self):
         """ Update model based on loss between expected Q values (from DDDQN) and actual Q values """
-        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size) # stochastic
+        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size, self.device) # stochastic
 
-        states = torch.from_numpy(states).float().to(self.device)
-        actions = torch.from_numpy(np.array(actions)).long().to(self.device)
-        rewards = torch.from_numpy(np.array(rewards)).float().to(self.device)
-        next_states = torch.from_numpy(next_states).float().to(self.device)
-        dones = torch.from_numpy(np.array(dones)).float().to(self.device)
-
+        self.main_network.train()
         q_values = self.main_network(states).gather(1, actions.unsqueeze(-1)).squeeze(-1)
-
         next_action_values = self.main_network(next_states).max(1)[1].unsqueeze(-1)
-        # using bellman backups
-        next_q_values = self.target_network(next_states).gather(1, next_action_values).detach().squeeze(-1) # NOTE: target network!!
+        # NOTE: target network!!
+        next_q_values = self.target_network(next_states).gather(1, next_action_values).detach().squeeze(-1)
 
         expected_q_values = rewards + self.gamma * next_q_values * (1 - dones)
 
@@ -187,13 +253,7 @@ class CQLAgent(DDQNAgent):
 
     def update_model(self):
         """ Update model based on loss between expected Q values (from DDDQN) and actual Q values """
-        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size) # stochastic
-
-        states = torch.from_numpy(states).float().to(self.device)
-        actions = torch.from_numpy(np.array(actions)).long().to(self.device)
-        rewards = torch.from_numpy(np.array(rewards)).float().to(self.device)
-        next_states = torch.from_numpy(next_states).float().to(self.device)
-        dones = torch.from_numpy(np.array(dones).astype(np.uint8)).float().to(self.device)
+        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size, self.device) # stochastic
 
         q_values = self.main_network(states).gather(1, actions.unsqueeze(-1)).squeeze(-1)
 
@@ -209,35 +269,4 @@ class CQLAgent(DDQNAgent):
 
         self.optimizer.zero_grad()
         q1_loss.backward()
-        self.optimizer.step()
-
-
-
-class FQIAgent(D3QNAgent):
-    """
-    Uses Fitted-Q Evaluation (FQE) to approximate the clinician Q-function using a neural net.
-     
-    TODO: what are we actually doing here? Is this imitation learning / behavior cloning?
-    """
-
-    def update_model(self):
-        """ Supervised Q-learning: regress Q(s, a) to observed reward (clinician action). """
-        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)  # ignore next_state, done
-
-        states = torch.from_numpy(states).float().to(self.device)
-        actions = torch.from_numpy(np.array(actions)).long().to(self.device)
-        rewards = torch.from_numpy(np.array(rewards)).float().to(self.device)
-        next_states = torch.from_numpy(next_states).float().to(self.device)
-        dones = torch.from_numpy(np.array(dones)).float().to(self.device)
-
-        q_values = self.main_network(states).gather(1, actions.unsqueeze(-1)).squeeze(-1)
-        
-        with torch.no_grad():
-            next_q_values = self.target_network(next_states)
-            max_next_q = next_q_values.max(1)[0]
-            target_q = rewards + self.gamma * (1 - dones) * max_next_q
-
-        loss = torch.nn.MSELoss()(q_values, target_q)
-        self.optimizer.zero_grad()
-        loss.backward()
         self.optimizer.step()
