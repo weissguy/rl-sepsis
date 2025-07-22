@@ -22,16 +22,22 @@ class OfflineDataset(torch.utils.data.Dataset):
     training using the PyTorch TensorDataset and DataLoader interfaces.
     """
 
-    def __init__(self, env):
+    def __init__(self, df):
+        """
+        Step through the environment, collecting observations as we go.
+        """
+        env = MIMICEnv(df)
         self.samples = []
-        state, _ = env.reset()
-        done = False
-        while not done:
-            action = env.get_logged_action()
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            self.samples.append((state, action, reward, next_state))
-            done = terminated or truncated
-            state = next_state
+        # collect data for each unique icu stay / trajectory
+        for _ in range(len(df['icustayid'].unique())):
+            state, _ = env.reset(stepwise=True)
+            done = False
+            while not done:
+                action = env.get_logged_action()
+                next_state, reward, terminated, truncated, _ = env.step(action)
+                self.samples.append((state, action, reward, next_state))
+                done = terminated or truncated
+                state = next_state
 
     def __len__(self):
         return len(self.samples)
@@ -73,8 +79,17 @@ class BehaviorPolicyNet(nn.Module):
     def get_action_probs(self, state):
         """ Returns a probability distribution over the action space. """
         logits = self.forward(state)
-        distribution = F.softmax(logits, dim=0)
+        distribution = F.softmax(logits)
         return distribution.detach().numpy()
+    
+    def select_action(self, state):
+        """
+        Supports both single and batched states. Returns actions as shape (batch_size, 1) or (1, 1).
+        """
+        if state.dim() == 1:
+            state = state.unsqueeze(0)  # Convert to batch of 1
+        logits = self.forward(state)
+        return torch.argmax(logits, dim=1, keepdim=True)
     
     
 
@@ -104,21 +119,7 @@ def compute_physician_policy(train_df, batch_size=64, verbose=True):
     a probability distribution of actions they might have taken.
     """
 
-    env = MIMICEnv(train_df)
-    loader = DataLoader(OfflineDataset(env), batch_size=batch_size, shuffle=True)
-
-    """
-    dataset = OfflineDataset(env)
-
-    states = get_states(train_df)
-    
-    actions = train_df.apply(get_action_id, axis=1)
-    actions = torch.tensor(actions.values, dtype=torch.long)
-
-    # train behavior policy network using physician actions
-    dataset = TensorDataset(states, actions)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True) # shuffle, ignoring trajectories
-    """
+    loader = DataLoader(OfflineDataset(train_df), batch_size=batch_size, shuffle=True)
 
     model = BehaviorPolicyNet()
     model.train()
@@ -151,28 +152,16 @@ def compute_physician_policy(train_df, batch_size=64, verbose=True):
 
 def evaluate_physician_policy(physician_policy, test_df):
 
-    env = MIMICEnv(test_df)
-    loader = DataLoader(OfflineDataset(env), shuffle=True) # batch size = 1
+    loader = DataLoader(OfflineDataset(test_df), shuffle=True) # batch size = 1
 
-    """
-    states = get_states(test_df)
-    
-    actions = test_df.apply(get_action_id, axis=1)
-    actions = torch.tensor(actions.values, dtype=torch.long)
-
-    # evaluate behavior policy network using physician actions
-    dataset = TensorDataset(states, actions)
-    loader = DataLoader(dataset, shuffle=True) # shuffle, ignoring trajectories
-    """
-
-    losses, all_probs = [], []
+    losses = []
+    action_hist = [0] * 25
     physician_policy.eval()
     for state, action, _, _ in tqdm(loader):
         logits = physician_policy(state)
         loss = F.cross_entropy(logits, action)
         losses.append(loss.item())
-        probs = F.softmax(logits, dim=0).detach().numpy()
-        all_probs.append(probs)
+        action_hist[logits.argmax()] += 1
 
     # plot losses
     fig, ax = plt.subplots()
@@ -182,12 +171,10 @@ def evaluate_physician_policy(physician_policy, test_df):
     print(f'mean eval loss: {np.mean(losses)}')
 
     # predicted-action histogram
-    all_probs = np.concatenate(all_probs, axis=0)
-    avg_probs = np.mean(all_probs, axis=0)
     fig, ax = plt.subplots()
-    ax.bar(np.arange(len(avg_probs)), avg_probs)
+    ax.plot(action_hist)
     ax.set_xlabel("Action")
-    ax.set_ylabel("Averaged Predicted Probability")
+    ax.set_ylabel("Frequency")
     plt.show()
 
 
@@ -214,20 +201,19 @@ class FQENet(nn.Module):
 
 def train_fqe(train_df, agent_policy, batch_size=64, lr=0.001, gamma=0.99):
 
-    env = MIMICEnv(train_df)
-    loader = DataLoader(OfflineDataset(env), batch_size=batch_size) # shuffle?!
+    loader = DataLoader(OfflineDataset(train_df), batch_size=batch_size) # don't shuffle, I think
 
-    fqe_net = FQENet(env.obs_dim, env.action_dim)
+    fqe_net = FQENet(state_dim=20, action_dim=25)
     optimizer = torch.optim.Adam(fqe_net.parameters(), lr=lr)
 
     n_epochs = 5
     for _ in range(n_epochs):
-        for state, action, reward, next_state in loader:
+        for state, action, reward, next_state in tqdm(loader):
 
             q_vals = fqe_net(state).gather(1, action.unsqueeze(1)).squeeze(1)
 
             next_action = agent_policy.select_action(state)
-            next_q_vals = fqe_net(next_state).gather(1, next_action.unsqueeze(1)).squeeze(1)
+            next_q_vals = fqe_net(next_state).gather(1, next_action).squeeze(1)
             target_q_vals = reward + (gamma * next_q_vals)
 
             loss = nn.MSELoss()(q_vals, target_q_vals)
@@ -236,23 +222,30 @@ def train_fqe(train_df, agent_policy, batch_size=64, lr=0.001, gamma=0.99):
             loss.backward()
             optimizer.step()
 
+    return fqe_net
 
 
-def off_policy_eval_fqe(fqe_net, init_states, agent_policy):
+
+def off_policy_eval_fqe(train_df, sepsis_df, agent_policy):
     """
     Fitted Q-Evaluation. Estimates the Q-function for agent_policy using fqe_net, by
     sampling from trajectories in the offline dataset.
 
     Assumes that fqe_net has already been trained. Returns Q_hat(s_0, pi_0).
     """
+
+    fqe_net = train_fqe(train_df, agent_policy)
+
+    init_states = get_states(sepsis_df[sepsis_df['initial_state'] == 1])
+
     with torch.no_grad():
-        init_actions = agent_policy(init_states)
-        q_values = fqe_net(init_states).gather(1, init_actions.unsqueeze(1))
+        init_actions = agent_policy.select_action(init_states)
+        q_values = fqe_net(init_states).gather(1, init_actions)
         return q_values.mean().item()
 
 
 
-def off_policy_eval_wis(physician_df, physician_policy, agent_policy, gamma=0.99):
+def off_policy_eval_wis(sepsis_df, physician_policy, agent_policy, gamma=0.99):
     """
     Off-policy evaluation with Weighted Importance Sampling (WIS). Given a set of trajectories,
     a behavioral policy (from compute_physician_policy), and a policy to evaluate (from model),
@@ -265,8 +258,8 @@ def off_policy_eval_wis(physician_df, physician_policy, agent_policy, gamma=0.99
     Note: might suffer from high variance.
     """
 
-    icustayids = physician_df['icustayid'].unique()
-    trajectories = [physician_df[physician_df['icustayid'] == idx] for idx in icustayids] # list of dfs
+    icustayids = sepsis_df['icustayid'].unique()
+    trajectories = [sepsis_df[sepsis_df['icustayid'] == idx] for idx in icustayids] # list of dfs
 
     def compute_rho(trajectory):
 
@@ -314,48 +307,72 @@ def off_policy_eval_wis(physician_df, physician_policy, agent_policy, gamma=0.99
 
 
 
-def off_policy_eval_dr(physician_df, model, gamma=0.99):
+def off_policy_eval_dr(sepsis_df, train_df, physician_policy, agent_policy, gamma=0.99):
     """
     Off-policy evaluation with the Doubly Robust method (DR). Given a set of trajectories,
     a behavioral policy (from compute_physician_policy), and a policy to evaluate (from model),
     we return an estimate of how well our policy performs on offline data.
 
-    We do this by combining WIS with FQE
+    We do this by combining WIS and FQE.
     """
-    pass
+
+    ### WIS ###
+
+    icustayids = sepsis_df['icustayid'].unique()
+    trajectories = [sepsis_df[sepsis_df['icustayid'] == idx] for idx in icustayids] # list of dfs
+
+    def compute_rho(trajectory):
+
+        states = get_states(trajectory)
+        actions = trajectory.apply(get_action_id, axis=1).values
+
+        agent_probs = np.array([agent_policy.get_action_probs(state) for state in states]) # (x,25)
+        agent_action_probs = agent_probs[np.arange(len(actions)), actions] # prob of action that was taken
+
+        physician_probs = np.array([physician_policy.get_action_probs(state) for state in states]) # (x,25)
+        physician_action_probs = physician_probs[np.arange(len(actions)), actions] # prob of action that was taken
+
+        eps = 1e-8 # avoid div. by zero
+        ratios = agent_action_probs / (physician_action_probs + eps)
+        return np.prod(ratios)
+
+
+    # list containing one cumulative rho per trajectory
+    rho_array = np.array([compute_rho(trajectory) for trajectory in trajectories])
+    # normalize for WIS
+    rho_array = rho_array / np.nansum(rho_array)
+
+    # TODO: clip rhos?
+
+    def compute_trial_estimate(trajectory):
+        rewards = trajectory['reward']
+        discounts = gamma ** np.arange(len(rewards))
+        return np.sum(discounts * rewards)
+
+    # list containing one estimated V value per trajectory
+    individual_trial_estimates = [compute_trial_estimate(trajectory) for trajectory in trajectories]
+    wis_estimate = np.nansum(individual_trial_estimates * rho_array)
+
+    
+    ### FQE ###
+
+    fqe_net = train_fqe(train_df, agent_policy)
+
+    init_states = get_states(sepsis_df[sepsis_df['initial_state'] == 1])
+
+    with torch.no_grad():
+        init_actions = agent_policy.select_action(init_states)
+        q_values = fqe_net(init_states).gather(1, init_actions)
+        fqe_estimate = q_values.mean().item()
+
+
+    # correction
+
+    correction_term = rho_array * 
 
 
 
+    return wis_estimate + fqe_estimate - correction_term
     
 
 
-if __name__ == '__main__':
-
-    sepsis_df = pd.read_csv('data/sepsis_df.csv')
-    sepsis_df = sepsis_df.sample(frac=1, random_state=42).reset_index(drop=True) # shuffle
-
-    cutoff = int(0.8 * len(sepsis_df))
-    train_df = sepsis_df[:cutoff]
-    test_df = sepsis_df[cutoff:]
-
-    # train
-    #physician_policy = compute_physician_policy(train_df, verbose=True)
-    #torch.save(physician_policy.state_dict(), 'models/physician_policy.pth')
-
-    # evaluate
-    #evaluate_physician_policy(physician_policy, test_df)
-
-    physician_policy = BehaviorPolicyNet()
-    physician_policy.load_state_dict(torch.load('models/physician_policy.pth'))
-
-    env = MIMICEnv()
-    d3qn_policy = D3QNAgent(state_dim=20, action_dim=25)
-
-    # train
-    #train_network(d3qn_policy, env, target_network=True)
-    #torch.save(d3qn_policy.main_network.state_dict(), 'models/d3qn_policy.pth')
-
-    d3qn_policy.main_network.load_state_dict(torch.load('models/d3qn_policy.pth'))
-
-    estimate = off_policy_eval_wis(sepsis_df, physician_policy, d3qn_policy)
-    print(f'IS estimate for D3QN: {estimate}')

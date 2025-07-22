@@ -157,20 +157,19 @@ class DDQNAgent():
         return distribution.detach().numpy()
 
 
-    def select_action(self, state, eps=None):
-        """ 
-        With probability 1-eps, selects action with the highest corr. Q value from the network. 
-        With probability eps, selects an action at random.
+    def select_action(self, state):
         """
-        # choose a random action, with probability eps
-        if eps is None:
-            eps = self.anneal_epsilon()
-        if np.random.rand() < eps:
-            return np.random.randint(self.action_dim)
-        
-        # choose the action that maximizes our q-function, with probability (1-eps)
-        action_values = self.get_action_values(state)
-        return torch.argmax(action_values).item() # in [0, 24]
+        Supports both single and batched states. Returns actions as shape (batch_size, 1) or (1, 1).
+        """
+        self.anneal_epsilon()
+        if state.dim() == 1:
+            state = state.unsqueeze(0)  # Convert to batch of 1
+        batch_size = state.shape[0]
+        if np.random.rand() < self.eps:
+            return torch.randint(0, self.action_dim, (batch_size, 1), device=self.device)
+        else:
+            action_values = self.get_action_values(state)
+            return torch.argmax(action_values, dim=1, keepdim=True)
     
 
     def anneal_epsilon(self):
@@ -178,7 +177,6 @@ class DDQNAgent():
         Exponentially decays epsilon until it reaches a min. value.
         """
         self.eps = max(self.eps * self.eps_decay, self.eps_final)
-        return self.eps
         
 
     def update_model(self):

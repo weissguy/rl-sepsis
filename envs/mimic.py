@@ -16,6 +16,8 @@ class ICUStay:
         self.index = 0
 
         df = sepsis_df[sepsis_df['icustayid'] == icustayid]
+        self.df = df # TODO remove
+        self.icustayid = icustayid # TODO remove
         self.mortality = df['died_in_hosp'].iloc[0]
 
         # each state is a string rep of a np array --> convert to np array
@@ -23,7 +25,8 @@ class ICUStay:
         self.states = np.stack([np.fromstring(state.strip('[]'), sep=' ', dtype=np.float32) for state in self.states])
 
         # convert each (iv, vaso) action into a 1D action id
-        self.actions = df.apply(lambda row: (5 * row['iv_bin']) + row['vaso_bin'], axis=1)
+        self.actions = df.apply(lambda row: (5 * row['iv_bin']) + row['vaso_bin'], axis=1).reset_index(drop=True)
+
 
     def increment_index(self):
         self.index += 1
@@ -65,15 +68,30 @@ class MIMICEnv(gym.Env):
         self.icustayids = self.sepsis_df['icustayid'].unique()
 
         # initialize data for one stay
+        self.current_id = None
         self.icustay = None
 
     
-    def reset(self, seed=None, options=None):
+    def reset(self, stepwise=False):
         super().reset()
 
-        # randomly choose a new trajectory
-        idx = np.random.choice(self.icustayids)
-        self.icustay = ICUStay(self.sepsis_df, idx)
+        if stepwise:
+            if self.current_id is None:
+                # initalize to first id
+                new_id = self.icustayids[0]
+            else:
+                # step forward to the next id in the sequence
+                old_id = self.current_id
+                new_index = np.where(self.icustayids == old_id)[0][0] + 1
+                if new_index >= len(self.icustayids):
+                    raise StopIteration('reached the end of icustayids')
+                new_id = self.icustayids[new_index]
+        else:
+            # randomly choose a new trajectory
+            new_id = np.random.choice(self.icustayids)
+
+        self.current_id = new_id
+        self.icustay = ICUStay(self.sepsis_df, new_id)
 
         observation = self._get_obs(done=False)
         info = {}
