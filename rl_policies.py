@@ -3,51 +3,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
+from torch.distributions import Categorical
 from collections import deque
 import numpy as np
 import random
-from tqdm import tqdm
 
-
-
-def train_network(self, env, n_episodes=50_000, target_network=False, update_freq=1000):
-    """
-    Training loop to learn a Q-function.
-    """
-    rewards, lengths = [], []
-
-    for i in tqdm(range(n_episodes)):
-        state, _ = env.reset()
-        done = False
-        total_reward, episode_length = 0, 0
-
-        while not done:
-            action = self.select_action(torch.from_numpy(state))
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            # store tuple in memory and do one training step
-            self.learn(state, action, reward, next_state, done)
-            # update for next timestep
-            state = next_state
-            total_reward += reward
-            episode_length += 1
-
-        rewards.append(total_reward)
-        lengths.append(episode_length)
-
-        # update the target network weights to match main network
-        if target_network and i % update_freq == 0:
-            self.hard_update()
-
-    return rewards, lengths
-
-
-
-class PPO():
-    """
-    Proximal Policy Optimization. A policy gradient method.
-    """
-    pass
+from networks import DDQN, Actor, Critic, Value
 
 
 
@@ -60,8 +22,6 @@ class ReplayMemory():
         """
         Stores a (s_t, a, r, s_t+1, d) tuple in memory.
         """
-        state = torch.from_numpy(state) # np array --> tensor
-        next_state = torch.from_numpy(next_state) # np array --> tensor
         self.buffer.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size, device):
@@ -75,62 +35,36 @@ class ReplayMemory():
         actions = torch.tensor(actions, dtype=torch.long).to(device)
         rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
         next_states = torch.stack(list(next_states), dim=0).float().to(device)
-        dones = torch.tensor(dones, dtype=torch.uint8).to(device)
+        dones = torch.tensor(dones, dtype=torch.float32).to(device)
 
         return states, actions, rewards, next_states, dones
 
     def __len__(self):
         return len(self.buffer)
-    
-
-class DDQN(nn.Module):
-    """ Dueling Deep Q-Network! """
-
-    # TODO: add batch normalization, leaky relu (from raghu, et al.)
-    def __init__(self, state_dim, action_dim, hidden_dim):
-        super().__init__()
-        self.fc1 = torch.nn.Linear(state_dim, hidden_dim)
-        self.fc2 = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.advantage = torch.nn.Linear(hidden_dim, action_dim)
-        self.value = torch.nn.Linear(hidden_dim, 1)
-        
-    def forward(self, state):
-        """
-        Forward pass. Two linear layers, following by the dueling split layer
-        (into advantage and value). Returns our Q value update.
-        """
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
-        advantage = self.advantage(x)
-        value = self.value(x)
-
-        return value + (advantage - advantage.mean()) # (25,)
 
 
 
 
-class DDQNAgent():
+class D3QNAgent():
     """
-    Dueling Deep Q-Network Agent
+    Diners, Drive-ins, and Dives Q-Learning
 
-    This is a functional agent by itself, but it's also a base class from which we can
-    implement D3QN and CQL (with just a few modifications to the Q-function update).
+    oh wait mb. Dueling Double Deep Q-Learning
     """
 
-    def __init__(self, state_dim, action_dim, hidden_dim=128, gamma=0.99, lr=0.001, 
-                 memory_capacity=100_000, batch_size=128, eps_start=0.1, eps_decay=0.9999, eps_final=0.05):
+    def __init__(self, state_dim, action_dim, hidden_dim=128, gamma=0.99, lr=1e-4,
+                 memory_capacity=100_000, batch_size=128):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.state_dim = state_dim # 20, i.e., (20,) latent vector
-        self.action_dim = action_dim # 25, i.e., 1 q-value per discrete action tuple
+        self.state_dim = state_dim # 20
+        self.action_dim = action_dim # 25
         self.gamma = gamma
         self.batch_size = batch_size
 
-        self.eps = eps_start
-        self.eps_decay = eps_decay
-        self.eps_final = eps_final
-
         self.main_network = DDQN(state_dim, action_dim, hidden_dim).to(self.device)
         self.optimizer = torch.optim.Adam(self.main_network.parameters(), lr=lr)
+
+        self.target_network = DDQN(state_dim, action_dim, hidden_dim).to(self.device)
+        self.target_network.load_state_dict(self.main_network.state_dict()) # same as main_network @init
 
         self.memory = ReplayMemory(memory_capacity)
 
@@ -139,55 +73,40 @@ class DDQNAgent():
         """ Store tuple in memory and do one round of model updates. """
         self.memory.store(state, action, reward, next_state, done)
         if len(self.memory) > self.batch_size:
-            self.main_network.train()
             self.update_model()
 
 
-    def get_action_values(self, state):
-        """ Returns a Tensor, with the learned Q-value associated with each action. """
-        self.main_network.eval()
-        with torch.no_grad():
-            return self.main_network(state)
+    def get_q_values(self, state):
+        """ Returns an array with the Q-value associated with each action. """
+        q_values = self.main_network(state)
+        return q_values.detach().numpy()
             
 
     def get_action_probs(self, state):
         """ Returns a probability distribution over the action space. """
-        action_values = self.get_action_values(state)
-        distribution = F.softmax(action_values, dim=-1)
+        q_values = self.main_network(state)
+        distribution = F.softmax(q_values, dim=-1)
         return distribution.detach().numpy()
 
 
-    def select_action(self, state):
+    def select_action(self, state, eval=False):
         """
         Supports both single and batched states. Returns actions as shape (batch_size, 1) or (1, 1).
+        Always greedily selects the action with the maximal estimated Q-value.
         """
-        self.anneal_epsilon()
-        if state.dim() == 1:
-            state = state.unsqueeze(0)  # Convert to batch of 1
-        batch_size = state.shape[0]
-        if np.random.rand() < self.eps:
-            return torch.randint(0, self.action_dim, (batch_size, 1), device=self.device)
-        else:
-            action_values = self.get_action_values(state)
-            return torch.argmax(action_values, dim=1, keepdim=True)
-    
-
-    def anneal_epsilon(self):
-        """
-        Exponentially decays epsilon until it reaches a min. value.
-        """
-        self.eps = max(self.eps * self.eps_decay, self.eps_final)
+        q_values = self.main_network(state)
+        return torch.argmax(q_values, dim=-1)
         
 
     def update_model(self):
         """
         Update model based on loss between expected Q values (from DDDQN) and actual Q values.
         """
-        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size, self.device) # stochastic
+        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size, self.device)
 
         q_values = self.main_network(states).gather(1, actions.unsqueeze(-1)).squeeze(-1)
         next_action_values = self.main_network(next_states).max(1)[1].unsqueeze(-1)
-        next_q_values = self.main_network(next_states).gather(1, next_action_values).detach().squeeze(-1)
+        next_q_values = self.target_network(next_states).gather(1, next_action_values).detach().squeeze(-1)
 
         expected_q_values = rewards + self.gamma * next_q_values * (1 - dones)
 
@@ -195,40 +114,7 @@ class DDQNAgent():
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-
-
-
-# low key diners drive ins and dives ah q-network
-
-class D3QNAgent(DDQNAgent):
-    """ Dueling Double Deep Q-Network Agent. adds in target network """
-
-    def __init__(self, state_dim, action_dim, hidden_dim=64, gamma=0.99, lr=0.001, 
-                 memory_capacity=10000, batch_size=64):
-        super().__init__(state_dim, action_dim, hidden_dim, gamma, lr, memory_capacity, batch_size)
-
-        self.target_network = DDQN(state_dim, action_dim, hidden_dim).to(self.device)
-        self.target_network.load_state_dict(self.main_network.state_dict()) # same as main_network @init
-        self.target_network.eval()
         
-
-    def update_model(self):
-        """ Update model based on loss between expected Q values (from DDDQN) and actual Q values """
-        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size, self.device) # stochastic
-
-        self.main_network.train()
-        q_values = self.main_network(states).gather(1, actions.unsqueeze(-1)).squeeze(-1)
-        next_action_values = self.main_network(next_states).max(1)[1].unsqueeze(-1)
-        # NOTE: target network!!
-        next_q_values = self.target_network(next_states).gather(1, next_action_values).detach().squeeze(-1)
-
-        expected_q_values = rewards + self.gamma * next_q_values * (1 - dones)
-
-        loss = torch.nn.MSELoss()(q_values, expected_q_values)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
 
     def hard_update(self):
         """ Periodically update target network parameters to match main network """
@@ -236,9 +122,9 @@ class D3QNAgent(DDQNAgent):
 
 
 
-class CQLAgent(DDQNAgent):
+class CQLAgent(D3QNAgent):
     """
-    Essentially DDQN, but performs a Q value update for which the expectation is a lower bound of the actual Q value!
+    Essentially D3QN, but performs a Q value update for which the expectation is a lower bound of the actual Q value!
     Should be careful that I don't underestimate too far. Using dueling, but not double, for this reason.
     """
 
@@ -249,22 +135,176 @@ class CQLAgent(DDQNAgent):
         return (logsumexp - q_a).mean()
     
 
-    def update_model(self):
+    def update_model(self, alpha=0.5):
         """ Update model based on loss between expected Q values (from DDDQN) and actual Q values """
         states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size, self.device) # stochastic
 
-        q_values = self.main_network(states).gather(1, actions.unsqueeze(-1)).squeeze(-1)
+        all_q_values = self.main_network(states)
+        cql1_loss = self.cql_loss(all_q_values, actions.unsqueeze(-1))
+        q_values = all_q_values.gather(1, actions.unsqueeze(-1)).squeeze(-1)
 
         next_action_values = self.main_network(next_states).max(1)[1].unsqueeze(-1)
-        # using bellman backups
-        next_q_values = self.main_network(next_states).gather(1, next_action_values).detach().squeeze(-1)
-
+        next_q_values = self.target_network(next_states).gather(1, next_action_values).detach().squeeze(-1)
         expected_q_values = rewards + self.gamma * next_q_values * (1 - dones)
 
-        cql1_loss = self.cql_loss(q_values, actions) # NOTE: extra loss term
         td_loss = torch.nn.MSELoss()(q_values, expected_q_values)
-        q1_loss = cql1_loss + 0.5 * td_loss # TODO: can tune weighting
+        q1_loss = cql1_loss + alpha * td_loss # TODO tune alpha
 
         self.optimizer.zero_grad()
         q1_loss.backward()
         self.optimizer.step()
+
+
+
+class IQLAgent():
+
+    def __init__(self, state_dim, action_dim, hidden_dim=128, lr=1e-3, gamma=0.99, temp=3, expectile=0.7, tau=5e-3):
+
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = torch.tensor([gamma])
+        self.temp = torch.tensor([temp])
+        self.expectile = torch.tensor([expectile])
+        self.tau = tau
+        
+        self.actor = Actor(state_dim, action_dim, hidden_dim)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
+
+        self.critic1 = Critic(state_dim, action_dim, hidden_dim, 1)
+        self.critic1_optimizer = torch.optim.Adam(self.critic1.parameters(), lr=lr)
+        self.critic1_target = Critic(state_dim, action_dim, hidden_dim, 1)
+        self.critic1_target.load_state_dict(self.critic1.state_dict())
+
+        self.critic2 = Critic(state_dim, action_dim, hidden_dim, 2)
+        self.critic2_optimizer = torch.optim.Adam(self.critic2.parameters(), lr=lr)
+        self.critic2_target = Critic(state_dim, action_dim, hidden_dim, 2)
+        self.critic2_target.load_state_dict(self.critic1.state_dict())
+
+        self.value_net = Value(state_dim, hidden_dim)
+        self.value_optimizer = torch.optim.Adam(self.value_net.parameters(), lr=lr)
+
+        
+    def select_action(self, state, eval=False):
+        """
+        During training, sample an action from the logits distribution.
+        During evaluation, choose the action with max. logit.
+        """
+        logits = self.actor(state)
+
+        if eval:
+            return torch.argmax(logits, dim=-1)
+        else:
+            dist = Categorical(logits=logits)
+            return dist.sample()
+        
+
+    def get_q_values(self, state):
+        """  
+        Returns a 1D array, containing one Q-value (estimated
+        from the target critic network) for each action.
+        """
+        q_values = []
+        for action in range(self.action_dim):
+            action = torch.tensor(action)
+            with torch.no_grad():
+                q1 = self.critic1_target(state, action)
+                q2 = self.critic2_target(state, action)
+                q_values.append(torch.min(q1, q2))
+
+        return np.array(q_values)
+        
+
+    def get_action_probs(self, state):
+        """
+        Returns a probability distribution over the action space.
+        """
+        logits = self.actor(state)
+        return F.softmax(logits).detach().numpy()
+    
+
+    def calc_policy_loss(self, states, actions):
+        with torch.no_grad():
+            value = self.value_net(states)
+            q1 = self.critic1_target(states, actions)
+            q2 = self.critic2_target(states, actions)
+            min_Q = torch.min(q1, q2) # take the more conservative q-value!
+
+        weights = torch.exp((min_Q - value) * self.temp)
+        weights = weights.clamp(max=100.0) # clip high values
+
+        # what is the probability of selecting these observed actions from the actor's learned distribution?
+        logits = self.actor(states)
+        dist = Categorical(logits=logits)
+        log_probs = dist.log_prob(actions)
+
+        actor_loss = -(weights * log_probs).mean()
+        return actor_loss
+    
+
+    def calc_value_loss(self, states, actions):
+        with torch.no_grad():
+            q1 = self.critic1_target(states, actions)
+            q2 = self.critic2_target(states, actions)
+            min_Q = torch.min(q1, q2) # take the more conservative q-value!
+
+        value = self.value_net(states)
+
+        # iql loss
+        diff = min_Q - value
+        weight = torch.where(diff > 0, self.expectile, (1-self.expectile))
+        value_loss = weight * (diff ** 2).mean()
+        return value_loss
+    
+
+    def calc_q_loss(self, states, actions, rewards, next_states, dones):
+        with torch.no_grad():
+            next_v = self.value_net(next_states)
+            q_target = rewards + (self.gamma * (1-dones) * next_v)
+
+        q1 = self.critic1(states, actions) # NOTE: main network
+        q2 = self.critic2(states, actions) # NOTE: main network
+        critic1_loss = F.mse_loss(q1, q_target)
+        critic2_loss = F.mse_loss(q2, q_target)
+        return critic1_loss, critic2_loss
+    
+
+    def learn(self, states, actions, rewards, next_states, dones):
+
+        # value loss
+        self.value_optimizer.zero_grad()
+        value_loss = self.calc_value_loss(states, actions)
+        value_loss.backward()
+        self.value_optimizer.step()
+
+        # policy loss
+        actor_loss = self.calc_policy_loss(states, actions)
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        # critic loss (seperately for each network)
+        critic1_loss, critic2_loss = self.calc_q_loss(states, actions, rewards, next_states, dones)
+
+        self.critic1_optimizer.zero_grad()
+        critic1_loss.backward()
+        clip_grad_norm_(self.critic1.parameters(), max_norm=1) # TODO is this standard for IQL?
+        self.critic1_optimizer.step()
+
+        self.critic2_optimizer.zero_grad()
+        critic2_loss.backward()
+        clip_grad_norm_(self.critic2.parameters(), max_norm=1)
+        self.critic2_optimizer.step()
+
+        # soft update critic target network to match critic network
+        self.soft_update(self.critic1, self.critic1_target)
+        self.soft_update(self.critic2, self.critic2_target)
+
+    
+    def soft_update(self, local_model, target_model):
+        """
+        Soft update model parameters.
+        θ_target = τ*θ_local + (1 - τ)*θ_target
+        """
+        for local_param, target_param in zip(local_model.parameters(), target_model.parameters()):
+            target_param.data.copy_(self.tau * local_param.data + (1 - self.tau) * target_param.data)
