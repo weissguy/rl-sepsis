@@ -88,7 +88,7 @@ class BehaviorPolicy(nn.Module):
     """
     Learn a behavior policy that mimics clinician actions taken in the data. 
 
-    Input: a latent state vector (20,)
+    Input: a state vector (20,) or (46,)
     Output: the predicted probability of choosing each action (25,)
     """
 

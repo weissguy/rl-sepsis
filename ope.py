@@ -24,13 +24,11 @@ class OfflineDataset(Dataset):
     Takes in a df --> allows us to make separate train/test/val datasets.
     """
 
-    # TODO: add dones?
-
-    def __init__(self, df):
+    def __init__(self, df, latent):
         """
         Step through the environment, collecting observations as we go.
         """
-        env = MIMICEnv(df)
+        env = MIMICEnv(df, latent)
         self.samples = []
         # collect data for each unique icu stay / trajectory
         for _ in range(len(df['icustayid'].unique())):
@@ -61,9 +59,9 @@ def compute_physician_policy(train_df, batch_size=64, verbose=True):
     a probability distribution of actions they might have taken.
     """
 
-    loader = DataLoader(OfflineDataset(train_df), batch_size=batch_size, shuffle=True)
+    loader = DataLoader(OfflineDataset(train_df, latent=False), batch_size=batch_size, shuffle=True)
 
-    model = BehaviorPolicy(staet_dim=20, action_dim=25, hidden_dim=256)
+    model = BehaviorPolicy(state_dim=46, action_dim=25, hidden_dim=256)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
@@ -94,7 +92,7 @@ def compute_physician_policy(train_df, batch_size=64, verbose=True):
 
 def evaluate_physician_policy(physician_policy, test_df):
 
-    loader = DataLoader(OfflineDataset(test_df), shuffle=True) # batch size = 1
+    loader = DataLoader(OfflineDataset(test_df, latent=False), shuffle=True) # batch size = 1
 
     losses = []
     action_hist = [0] * 25
@@ -122,9 +120,9 @@ def evaluate_physician_policy(physician_policy, test_df):
 
     
 
-def train_fqe(train_df, agent_policy, batch_size=64, lr=0.001, gamma=0.99):
+def train_fqe(train_df, agent_policy, latent=True, batch_size=64, lr=0.001, gamma=0.99):
 
-    loader = DataLoader(OfflineDataset(train_df), batch_size=batch_size) # don't shuffle, I think
+    loader = DataLoader(OfflineDataset(train_df, latent), batch_size=batch_size) # don't shuffle, I think
 
     fqe_net = FQENet(state_dim=20, action_dim=25, hidden_dim=64)
     optimizer = torch.optim.Adam(fqe_net.parameters(), lr=lr)
@@ -149,7 +147,7 @@ def train_fqe(train_df, agent_policy, batch_size=64, lr=0.001, gamma=0.99):
 
 
 
-def off_policy_eval_fqe(train_df, sepsis_df, agent_policy, return_fqe_net=False):
+def ope_fqe(train_df, sepsis_df, agent_policy, return_fqe_net=False):
     """
     Fitted Q-Evaluation. Estimates the Q-function for agent_policy using fqe_net, by
     sampling from trajectories in the offline dataset.
@@ -173,7 +171,7 @@ def off_policy_eval_fqe(train_df, sepsis_df, agent_policy, return_fqe_net=False)
 
 
 
-def off_policy_eval_wis(sepsis_df, physician_policy, agent_policy, gamma=0.99):
+def ope_wis(sepsis_df, physician_policy, agent_policy, gamma=0.99):
     """
     Off-policy evaluation with Weighted Importance Sampling (WIS). Given a set of trajectories,
     a behavioral policy (from compute_physician_policy), and a policy to evaluate (from model),
@@ -238,7 +236,7 @@ def off_policy_eval_wis(sepsis_df, physician_policy, agent_policy, gamma=0.99):
 
 
 
-def off_policy_eval_dr(sepsis_df, train_df, physician_policy, agent_policy, gamma=0.99):
+def ope_doubly_robust(train_df, sepsis_df, physician_policy, agent_policy, gamma=0.99):
     """
     Off-policy evaluation with the Doubly Robust method (DR). Given a set of trajectories,
     a behavioral policy (from compute_physician_policy), and a policy to evaluate (from model),
@@ -247,9 +245,8 @@ def off_policy_eval_dr(sepsis_df, train_df, physician_policy, agent_policy, gamm
     We do this by combining WIS and FQE.
     """
 
-    wis_estimate = off_policy_eval_wis(sepsis_df, physician_policy, agent_policy, gamma)
-
-    fqe_estimate, fqe_net = off_policy_eval_fqe(train_df, sepsis_df, agent_policy, return_fqe_net=True)
+    fqe_estimate, fqe_net = ope_fqe(train_df, sepsis_df, agent_policy, return_fqe_net=True)
+    wis_estimate = ope_wis(sepsis_df, physician_policy, agent_policy, gamma)
 
     icustayids = sepsis_df['icustayid'].unique()
     trajectories = [sepsis_df[sepsis_df['icustayid'] == idx] for idx in icustayids] # list of dfs
@@ -277,7 +274,7 @@ def off_policy_eval_dr(sepsis_df, train_df, physician_policy, agent_policy, gamm
             q_taken = q_values[np.arange(len(actions)), actions].numpy()
 
             # q-values for evaluation policy actions
-            agent_actions = agent_policy.select_action(states).squeeze(1).numpy()
+            agent_actions = agent_policy.select_action(states).squeeze(-1).numpy()
             q_agent = q_values[np.arange(len(actions)), agent_actions].numpy()
 
         # DR correction for this trajectory

@@ -31,12 +31,15 @@ class ICUStay:
     def increment_index(self):
         self.index += 1
 
-    def get_state(self):
+    def get_state(self, latent):
         """ Returns current state as a numpy array """
         if self.is_stay_over():
             raise ValueError('Patient ICU stay is over. No state available.')
         
-        return self.latent_states[self.index]
+        if latent:
+            return self.latent_states[self.index]
+        else:
+            return self.df[STATE_COLS].iloc[self.index].values
     
     def get_action(self):
         """ Returns current logged action as a numpy array """
@@ -46,7 +49,7 @@ class ICUStay:
         return self.actions[self.index]
 
     def is_stay_over(self):
-        return self.index >= len(self.latent_states)
+        return self.index >= len(self.df)
     
     def survives(self):
         return self.mortality == 0
@@ -55,11 +58,12 @@ class ICUStay:
 
 class MIMICEnv(gym.Env):
 
-    def __init__(self, df):
+    def __init__(self, df, latent):
 
-        # continuous, 20-dimensional vector (for now)
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32)
-        self.obs_dim = 20
+        # if latent --> 20-dimensional vector, else 46-dimensional vector
+        self.latent = latent
+        self.obs_dim = 20 if latent else 46
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32)
 
         # discrete, (5,5) actions --> maps to 25 discrete 1D actions
         self.action_space = gym.spaces.Discrete(25)
@@ -88,6 +92,7 @@ class MIMICEnv(gym.Env):
                 if new_index >= len(self.icustayids):
                     raise StopIteration('Reached the end of icustayids')
                 new_id = self.icustayids[new_index]
+
         else:
             # randomly choose a new trajectory
             new_id = np.random.choice(self.icustayids)
@@ -110,7 +115,7 @@ class MIMICEnv(gym.Env):
         if done:
             return torch.zeros(self.obs_dim, dtype=torch.float32) # dummy state
         else:
-            state = self.icustay.get_state()
+            state = self.icustay.get_state(self.latent)
             return torch.from_numpy(state).float()
     
 

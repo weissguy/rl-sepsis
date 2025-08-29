@@ -95,7 +95,12 @@ class D3QNAgent():
         Always greedily selects the action with the maximal estimated Q-value.
         """
         q_values = self.main_network(state)
-        return torch.argmax(q_values, dim=-1)
+        if eval:
+            return torch.argmax(q_values, dim=-1)
+        else:
+            probs = F.softmax(q_values, dim=-1)
+            dist = Categorical(probs=probs)
+            return dist.sample()
         
 
     def update_model(self):

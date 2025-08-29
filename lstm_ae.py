@@ -62,8 +62,9 @@ class Decoder(nn.Module):
         return dec_out, hidden_state
 
 
-class LSTMAE():
+class LSTMAE(nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim, seq_len, dropout_ratio=0.0):
+        super().__init__()
         self.encoder = Encoder(input_dim, hidden_dim, latent_dim, seq_len, dropout_ratio)
         self.decoder = Decoder(input_dim, hidden_dim, latent_dim, seq_len, dropout_ratio)
 
